@@ -4,11 +4,13 @@ Motion Detection Video Organizer
 Detects motion in videos and categorizes by people, pets, or other motion
 with timestamping and symlink organization for easy access.
 
-Features:
+Additional features:
 - Scan directories for videos or process live camera feeds
 - Select one or more cameras using --camera
 - Define monitoring zones and exclusion zones
-- Configurable via CLI or JSON file
+- Support JSON config files
+- Optional HOG person detection mode
+- Optional clip recording on detected events
 """
 
 import argparse
@@ -45,6 +47,13 @@ DEFAULT_CONFIG = {
     "CAMERAS": [],
     "ZONES": [],
     "EXCLUSIONS": [],
+    "DETECTOR": "heuristic",
+    "RECORD_CLIPS": False,
+    "CLIP_DIR": "motion_clips",
+    "HOG_SCALE": 1.05,
+    "HOG_STRIDE": [4, 4],
+    "HOG_PADDING": [8, 8],
+    "HOG_THRESHOLD": 0.0,
 }
 
 
@@ -123,6 +132,8 @@ class MotionDetector:
             "other_motion": self.output_base / self.date_str / "other_motion",
             "logs": self.output_base / "logs",
         }
+        self.clip_root = Path(self.config.get("CLIP_DIR", "motion_clips")).resolve()
+        self.clip_root.mkdir(parents=True, exist_ok=True)
         self.logger = self._setup_logging()
         self.setup_directories()
         self.stats = {
@@ -293,7 +304,69 @@ class MotionDetector:
         significant_contours = [c for c in contours if cv2.contourArea(c) > self.config["MIN_MOTION_AREA"]]
         return len(significant_contours) > 0, cleaned
 
+    def _filter_roi(self, boxes, zones=None, exclusions=None):
+        selected = []
+        for box in boxes:
+            x, y, w, h = box
+            cx = x + (w / 2)
+            cy = y + (h / 2)
+            point = (float(cx), float(cy))
+
+            inside_zone = True
+            if zones:
+                inside_zone = False
+                for poly in zones:
+                    pts = np.array(poly, dtype=np.int32)
+                    result = cv2.pointPolygonTest(pts, point, False)
+                    if result >= 0:
+                        inside_zone = True
+                        break
+
+            if not inside_zone:
+                continue
+
+            if exclusions:
+                for poly in exclusions:
+                    pts = np.array(poly, dtype=np.int32)
+                    result = cv2.pointPolygonTest(pts, point, False)
+                    if result >= 0:
+                        inside_zone = False
+                        break
+            if inside_zone:
+                selected.append({
+                    "area": int(w * h),
+                    "aspect_ratio": float(w) / float(h) if h > 0 else 0.0,
+                    "height": int(h),
+                    "width": int(w),
+                    "bbox": [int(x), int(y), int(w), int(h)],
+                })
+        return selected
+
+    def detect_hog_objects(self, frame, zones=None, exclusions=None):
+        frame = self.resize_frame(frame)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        hog = cv2.HOGDescriptor()
+        hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+
+        boxes, _ = hog.detectMultiScale(
+            gray,
+            winStride=(int(self.config.get("HOG_STRIDE", [4, 4])[0]), int(self.config.get("HOG_STRIDE", [4, 4])[1])),
+            padding=(int(self.config.get("HOG_PADDING", [8, 8])[0]), int(self.config.get("HOG_PADDING", [8, 8])[1])),
+            scale=float(self.config.get("HOG_SCALE", 1.05)),
+            hitThreshold=float(self.config.get("HOG_THRESHOLD", 0.0)),
+        )
+
+        if boxes is None or len(boxes) == 0:
+            return False, []
+
+        filtered = self._filter_roi([tuple(b) for b in boxes], zones, exclusions)
+        return len(filtered) > 0, filtered
+
     def detect_objects(self, frame, zones=None, exclusions=None):
+        detector_type = str(self.config.get("DETECTOR", "heuristic")).lower()
+        if detector_type == "hog":
+            return self.detect_hog_objects(frame, zones, exclusions)
+
         frame = self.resize_frame(frame)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -374,6 +447,34 @@ class MotionDetector:
             self.logger.warning(f"Could not create link/copy for {source}: {str(e)}")
             return False
 
+    def save_event_clip(self, frames, label):
+        if not frames:
+            return
+
+        if not self.config.get("RECORD_CLIPS", False):
+            return
+
+        clip_dir = Path(self.config.get("CLIP_DIR", "motion_clips")).resolve()
+        clip_dir.mkdir(parents=True, exist_ok=True)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        clip_path = clip_dir / f"{label}_{timestamp}.mp4"
+
+        if not frames:
+            return
+
+        height, width = frames[0].shape[:2]
+        fps = 10.0
+        writer = cv2.VideoWriter(str(clip_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+        if not writer.isOpened():
+            self.logger.warning(f"Could not create clip writer for {clip_path}")
+            return
+
+        for frame in frames:
+            writer.write(frame)
+        writer.release()
+        self.logger.info(f"Saved clip: {clip_path}")
+
     def process_camera(self, camera: CameraConfig):
         self.logger.info(f"Opening camera/source: {camera.name} -> {camera.source}")
         cap = cv2.VideoCapture(camera.source)
@@ -387,7 +488,7 @@ class MotionDetector:
         duration_seconds = frame_count / fps if fps > 0 else 0.0
 
         bg_sub = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=50, detectShadows=True)
-
+        event_frames = []
         has_motion = False
         object_type = None
         detected_frames = []
@@ -405,6 +506,11 @@ class MotionDetector:
             motion_detected, _ = self.detect_motion(frame, bg_sub, camera.zones, camera.exclusions)
             if motion_detected:
                 has_motion = True
+                if self.config.get("RECORD_CLIPS", False):
+                    event_frames.append(frame.copy())
+                    if len(event_frames) > 30:
+                        event_frames.pop(0)
+
                 objects_detected, objects = self.detect_objects(frame, camera.zones, camera.exclusions)
                 if objects_detected:
                     classified_type = self.classify_object_type(objects)
@@ -425,6 +531,7 @@ class MotionDetector:
             object_type=object_type,
             detected_frames=detected_frames,
             duration=duration_seconds,
+            event_frames=event_frames,
         )
 
     def process_video(self, video_path):
@@ -447,6 +554,7 @@ class MotionDetector:
             has_motion = False
             object_type = None
             detected_frames = []
+            event_frames = []
             frame_index = 0
 
             while True:
@@ -466,6 +574,10 @@ class MotionDetector:
                 )
                 if motion_detected:
                     has_motion = True
+                    if self.config.get("RECORD_CLIPS", False):
+                        event_frames.append(frame.copy())
+                        if len(event_frames) > 30:
+                            event_frames.pop(0)
                     objects_detected, objects = self.detect_objects(
                         frame,
                         self.config.get("ZONES", []),
@@ -489,6 +601,7 @@ class MotionDetector:
                 object_type=object_type,
                 detected_frames=detected_frames,
                 duration=duration_seconds,
+                event_frames=event_frames,
             )
 
         except Exception as e:
@@ -498,7 +611,7 @@ class MotionDetector:
             if cap is not None:
                 cap.release()
 
-    def categorize_and_save(self, source_path, label, has_motion, object_type, detected_frames, duration):
+    def categorize_and_save(self, source_path, label, has_motion, object_type, detected_frames, duration, event_frames=None):
         if not has_motion:
             self.stats["no_motion_videos"] += 1
             self.logger.info(f"  → No motion detected for {label}")
@@ -534,6 +647,7 @@ class MotionDetector:
             "detection_count": len(detected_frames),
             "zones": self.config.get("ZONES", []),
             "exclusions": self.config.get("EXCLUSIONS", []),
+            "detector": self.config.get("DETECTOR", "heuristic"),
         }
 
         try:
@@ -542,6 +656,9 @@ class MotionDetector:
             self.logger.info(f"  → Categorized as: {category} ({len(detected_frames)} detections)")
         except Exception as e:
             self.logger.error(f"Failed to write metadata: {str(e)}")
+
+        if self.config.get("RECORD_CLIPS", False) and event_frames:
+            self.save_event_clip(event_frames, f"{category}_{uuid.uuid4().hex[:8]}")
 
     def scan_and_process(self, search_dir):
         video_files = set()
@@ -584,37 +701,33 @@ def parse_args():
     parser.add_argument("--sample-interval", type=int, default=DEFAULT_CONFIG["SAMPLE_INTERVAL"], help="Check every Nth frame")
     parser.add_argument("--resize-width", type=int, default=DEFAULT_CONFIG["RESIZE_WIDTH"], help="Resize width for processing (0 = disabled)")
     parser.add_argument("--min-motion-area", type=int, default=DEFAULT_CONFIG["MIN_MOTION_AREA"], help="Minimum contour area to count as motion")
-    parser.add_argument("--camera", action="append", default=[], help="Camera or video source to process. Repeat to add multiple sources. Examples: --camera 0 --camera /dev/video0 --camera camera.mp4")
+    parser.add_argument("--camera", action="append", default=[], help="Camera or video source to process. Repeat for multiple sources. Examples: --camera 0 --camera /dev/video0 --camera camera.mp4")
     parser.add_argument("--zone", action="append", default=[], help="Polygon monitoring zone in x,y:x,y:... format. Repeat for multiple zones.")
     parser.add_argument("--exclude", action="append", default=[], help="Polygon exclusion in x,y:x,y:... format. Repeat for multiple exclusions.")
-    parser.add_argument("--zone-file", default=None, help="JSON file with 'zones', 'exclusions', and 'cameras' keys.")
+    parser.add_argument("--config", default=None, help="JSON configuration file path")
+    parser.add_argument("--detector", choices=["heuristic", "hog"], default=DEFAULT_CONFIG["DETECTOR"], help="Detection mode")
+    parser.add_argument("--record-clips", action="store_true", default=DEFAULT_CONFIG["RECORD_CLIPS"], help="Save short event clips when motion is detected")
+    parser.add_argument("--clip-dir", default=DEFAULT_CONFIG["CLIP_DIR"], help="Directory used for saved event clips")
     return parser.parse_args()
 
 
-def load_zone_file(path):
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        zones = data.get("zones", [])
-        exclusions = data.get("exclusions", [])
-        cameras = data.get("cameras", [])
-        return zones, exclusions, cameras
-    except Exception as e:
-        raise ValueError(f"Could not load zone file '{path}': {e}")
+def load_json_config(path):
+    with open(path, "r", encoding="utf-8") as f:
+        loaded = json.load(f)
+    return loaded
 
 
-def build_camera_configs(args):
-    file_zones = []
-    file_exclusions = []
-    file_cameras = []
+def build_camera_configs(args, extra_config=None):
+    config = extra_config or {}
 
-    if args.zone_file:
-        file_zones, file_exclusions, file_cameras = load_zone_file(args.zone_file)
+    file_zones = config.get("zones", [])
+    file_exclusions = config.get("exclusions", [])
+    file_cameras = config.get("cameras", [])
 
-    config_zones = [parse_polygon(z) for z in args.zone]
-    config_exclusions = [parse_polygon(z) for z in args.exclude]
-    config_zones = [z for z in file_zones + config_zones if z]
-    config_exclusions = [z for z in file_exclusions + config_exclusions if z]
+    cli_zone_polygons = [parse_polygon(z) for z in args.zone]
+    cli_exclude_polygons = [parse_polygon(z) for z in args.exclude]
+    config_zones = [z for z in list(file_zones) + cli_zone_polygons if z]
+    config_exclusions = [z for z in list(file_exclusions) + cli_exclude_polygons if z]
 
     if args.camera:
         cameras = []
@@ -636,19 +749,38 @@ def build_camera_configs(args):
             if isinstance(source, dict):
                 source_value = parse_camera_source(str(source.get("source", idx)))
                 name = source.get("name", f"camera_{idx}")
-                zones = src_zones = source.get("zones", config_zones)
+                zones = source.get("zones", config_zones)
                 exclusions = source.get("exclusions", config_exclusions)
             else:
                 source_value = parse_camera_source(str(source))
                 name = f"camera_{idx}"
                 zones = config_zones
                 exclusions = config_exclusions
+
+            zone_list = []
+            for item in zones:
+                if isinstance(item, str):
+                    parsed = parse_polygon(item)
+                    if parsed:
+                        zone_list.append(parsed)
+                elif isinstance(item, list):
+                    zone_list.append([(int(x), int(y)) for x, y in item])
+
+            exclusion_list = []
+            for item in exclusions:
+                if isinstance(item, str):
+                    parsed = parse_polygon(item)
+                    if parsed:
+                        exclusion_list.append(parsed)
+                elif isinstance(item, list):
+                    exclusion_list.append([(int(x), int(y)) for x, y in item])
+
             cameras.append(
                 CameraConfig(
                     source=source_value,
                     name=name,
-                    zones=[parse_polygon(z) for z in zones if isinstance(z, str)] + [z for z in zones if isinstance(z, list)],
-                    exclusions=[parse_polygon(z) for z in exclusions if isinstance(z, str)] + [z for z in exclusions if isinstance(z, list)],
+                    zones=zone_list,
+                    exclusions=exclusion_list,
                 )
             )
         return cameras, config_zones, config_exclusions
@@ -666,7 +798,12 @@ def build_camera_configs(args):
 
 def main():
     args = parse_args()
-    cameras, zone_list, exclusion_list = build_camera_configs(args)
+
+    extra_config = {}
+    if args.config:
+        extra_config = load_json_config(args.config)
+
+    cameras, zone_list, exclusion_list = build_camera_configs(args, extra_config)
 
     config = {
         "VIDEO_SEARCH_DIR": args.search_dir,
@@ -685,22 +822,22 @@ def main():
             }
             for camera in cameras
         ],
+        "DETECTOR": args.detector,
+        "RECORD_CLIPS": bool(args.record_clips),
+        "CLIP_DIR": args.clip_dir,
     }
+    config.update(extra_config)
 
     detector = MotionDetector(config=config, cameras=cameras)
     detector.logger.info("Motion Detection Video Organizer Started")
     detector.logger.info(f"Search directory: {args.search_dir}")
     detector.logger.info(f"Zones configured: {zone_list}")
     detector.logger.info(f"Exclusions configured: {exclusion_list}")
+    detector.logger.info(f"Detection mode: {args.detector}")
 
-    if args.camera or args.zone_file:
-        # If CLI camera sources or file config includes cameras, process them
-        if args.camera:
-            for camera in cameras:
-                detector.process_camera(camera)
-        elif args.zone_file:
-            for camera in cameras:
-                detector.process_camera(camera)
+    if args.camera or args.config:
+        for camera in cameras:
+            detector.process_camera(camera)
     else:
         detector.scan_and_process(args.search_dir)
 
