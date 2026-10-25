@@ -19,11 +19,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY requirements.txt .
+COPY requirements.txt ./
 RUN pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt
 
-COPY motion_detector.py .
-COPY app.py .
-COPY sample_config.json .
+COPY motion_detector.py ./
+COPY app.py ./
+COPY sample_config.json ./
 
 CMD ["python", "app.py"]
