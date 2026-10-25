@@ -11,6 +11,7 @@ Additional features:
 - Support JSON config files
 - Optional HOG person detection mode
 - Optional clip recording on detected events
+- Optional YOLOv8-compatible detection pipeline with heuristic fallback
 """
 
 import argparse
@@ -54,6 +55,10 @@ DEFAULT_CONFIG = {
     "HOG_STRIDE": [4, 4],
     "HOG_PADDING": [8, 8],
     "HOG_THRESHOLD": 0.0,
+    "DISPLAY": False,
+    "SHOW_ZONES": False,
+    "CONFIDENCE": 0.35,
+    "MODEL_PATH": None,
 }
 
 
@@ -362,11 +367,45 @@ class MotionDetector:
         filtered = self._filter_roi([tuple(b) for b in boxes], zones, exclusions)
         return len(filtered) > 0, filtered
 
-    def detect_objects(self, frame, zones=None, exclusions=None):
-        detector_type = str(self.config.get("DETECTOR", "heuristic")).lower()
-        if detector_type == "hog":
-            return self.detect_hog_objects(frame, zones, exclusions)
+    def detect_yolov8_objects(self, frame, zones=None, exclusions=None):
+        """Compatibility wrapper for YOLOv8-style configs.
 
+        If ultralytics is available, prefer it; otherwise fall back to the same
+        heuristic object detection used by the default pipeline. This keeps the
+        sample config valid without breaking older detector configurations.
+        """
+        try:
+            from ultralytics import YOLO
+
+            model_path = self.config.get("MODEL_PATH")
+            model = YOLO(model_path) if model_path else YOLO("yolov8n.pt")
+            conf = float(self.config.get("CONFIDENCE", 0.35))
+            results = model(frame, verbose=False, conf=conf)
+
+            boxes = []
+            for result in results:
+                for box in result.boxes:
+                    x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                    w = max(0, x2 - x1)
+                    h = max(0, y2 - y1)
+                    if w <= 0 or h <= 0:
+                        continue
+                    box_data = {
+                        "area": int(w * h),
+                        "aspect_ratio": float(w) / float(h) if h > 0 else 0.0,
+                        "height": h,
+                        "width": w,
+                        "bbox": [x1, y1, w, h],
+                    }
+                    if self._filter_roi([box_data["bbox"]], zones, exclusions):
+                        boxes.append(box_data)
+            return len(boxes) > 0, boxes
+        except Exception:
+            pass
+
+        return self.detect_objects_heuristic(frame, zones, exclusions)
+
+    def detect_objects_heuristic(self, frame, zones=None, exclusions=None):
         frame = self.resize_frame(frame)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -400,6 +439,15 @@ class MotionDetector:
             })
 
         return len(detected_objects) > 0, detected_objects
+
+    def detect_objects(self, frame, zones=None, exclusions=None):
+        detector_type = str(self.config.get("DETECTOR", "heuristic")).lower()
+        if detector_type == "hog":
+            return self.detect_hog_objects(frame, zones, exclusions)
+        if detector_type in {"yolov8", "yolo", "yolov5", "yolov7"}:
+            return self.detect_yolov8_objects(frame, zones, exclusions)
+
+        return self.detect_objects_heuristic(frame, zones, exclusions)
 
     def classify_object_type(self, objects):
         if not objects:
@@ -705,9 +753,13 @@ def parse_args():
     parser.add_argument("--zone", action="append", default=[], help="Polygon monitoring zone in x,y:x,y:... format. Repeat for multiple zones.")
     parser.add_argument("--exclude", action="append", default=[], help="Polygon exclusion in x,y:x,y:... format. Repeat for multiple exclusions.")
     parser.add_argument("--config", default=None, help="JSON configuration file path")
-    parser.add_argument("--detector", choices=["heuristic", "hog"], default=DEFAULT_CONFIG["DETECTOR"], help="Detection mode")
+    parser.add_argument("--detector", choices=["heuristic", "hog", "yolov8", "yolo"], default=DEFAULT_CONFIG["DETECTOR"], help="Detection mode")
     parser.add_argument("--record-clips", action="store_true", default=DEFAULT_CONFIG["RECORD_CLIPS"], help="Save short event clips when motion is detected")
     parser.add_argument("--clip-dir", default=DEFAULT_CONFIG["CLIP_DIR"], help="Directory used for saved event clips")
+    parser.add_argument("--model-path", default=DEFAULT_CONFIG["MODEL_PATH"], help="Optional path to a YOLO model file")
+    parser.add_argument("--confidence", type=float, default=DEFAULT_CONFIG["CONFIDENCE"], help="Minimum confidence for YOLO detection")
+    parser.add_argument("--display", action="store_true", default=DEFAULT_CONFIG["DISPLAY"], help="Display live processing window")
+    parser.add_argument("--show-zones", action="store_true", default=DEFAULT_CONFIG["SHOW_ZONES"], help="Overlay ROI zones in visual output")
     return parser.parse_args()
 
 
@@ -825,6 +877,10 @@ def main():
         "DETECTOR": args.detector,
         "RECORD_CLIPS": bool(args.record_clips),
         "CLIP_DIR": args.clip_dir,
+        "MODEL_PATH": args.model_path,
+        "CONFIDENCE": args.confidence,
+        "DISPLAY": bool(args.display),
+        "SHOW_ZONES": bool(args.show_zones),
     }
     config.update(extra_config)
 
